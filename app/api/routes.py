@@ -1,41 +1,87 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
-from app.services.enrichment_service import enrich_tasks
-from app.services.pdf_service import extract_text_from_pdf
-from app.services.risk_service import score_task_risk
-from app.services.scheduler_service import build_daily_plan, build_gantt
-from app.services.task_extraction_service import extract_tasks_from_text
+from app.services.analysis_service import analyze_pdf_file
+from app.services.job_service import create_job, get_job, get_job_result, process_job
+from app.services.pdf_service import (
+    InvalidUploadError,
+    PdfProcessingError,
+    UploadTooLargeError,
+    delete_file,
+    save_upload_to_disk,
+)
 
 router = APIRouter()
 
 
+def _upload_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, InvalidUploadError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, UploadTooLargeError):
+        return HTTPException(status_code=413, detail=str(exc))
+    if isinstance(exc, PdfProcessingError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=500, detail="Unexpected PDF processing error.")
+
+
 @router.post("/analyze-pdf")
 async def analyze_pdf(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    stored_upload = None
 
-    text = await extract_text_from_pdf(file)
-    if not text.strip():
-        raise HTTPException(status_code=422, detail="Could not extract text from the uploaded PDF.")
+    try:
+        stored_upload = await save_upload_to_disk(file)
+        return analyze_pdf_file(stored_upload["filename"], stored_upload["path"])
+    except (InvalidUploadError, UploadTooLargeError, PdfProcessingError) as exc:
+        raise _upload_exception(exc) from exc
+    finally:
+        if stored_upload:
+            delete_file(stored_upload["path"])
 
-    # 1. Extract raw tasks from PDF text
-    tasks = extract_tasks_from_text(text)
 
-    # 2. Enrich with historical data (manhours, resources, risk_factor)
-    tasks = enrich_tasks(tasks)
+@router.post("/analyze-pdf/jobs", status_code=202)
+async def create_pdf_analysis_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    try:
+        stored_upload = await save_upload_to_disk(file)
+        job = create_job(
+            filename=stored_upload["filename"],
+            upload_path=stored_upload["path"],
+            size_bytes=stored_upload["size_bytes"],
+        )
+        background_tasks.add_task(process_job, job["job_id"])
+        return job
+    except (InvalidUploadError, UploadTooLargeError, PdfProcessingError) as exc:
+        raise _upload_exception(exc) from exc
 
-    # 3. Score risk using enriched task data
-    for task in tasks:
-        task["risk_score"] = score_task_risk(task)
 
-    # 4. Build daily plan and Gantt
-    plan = build_daily_plan(tasks)
-    gantt = build_gantt(plan)
+@router.get("/analyze-pdf/jobs/{job_id}")
+def get_pdf_analysis_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
 
-    return {
-        "filename": file.filename,
-        "tasks_detected": len(tasks),
-        "tasks": tasks,
-        "daily_plan": plan,
-        "gantt": gantt,
-    }
+
+@router.get("/analyze-pdf/jobs/{job_id}/result")
+def get_pdf_analysis_job_result(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["status"] in {"queued", "processing"}:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": job["status"],
+                "detail": "PDF analysis is still running.",
+            },
+        )
+    if job["status"] == "failed":
+        raise HTTPException(status_code=409, detail=job["error"] or "PDF analysis failed.")
+
+    result = get_job_result(job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Job result not found.")
+    return result

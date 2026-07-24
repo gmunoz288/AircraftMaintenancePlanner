@@ -1,7 +1,7 @@
 """Integration tests for the /api/analyze-pdf endpoint."""
-import io
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -28,6 +28,12 @@ def _patch_pdf_extraction(text: str):
     mock_reader = MagicMock()
     mock_reader.pages = [mock_page]
     return patch("app.services.pdf_service.PdfReader", return_value=mock_reader)
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_storage(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.config.UPLOAD_DIR", tmp_path / "uploads")
+    monkeypatch.setattr("app.config.RESULTS_DIR", tmp_path / "results")
 
 
 class TestAnalyzePdfEndpoint:
@@ -109,3 +115,48 @@ class TestAnalyzePdfEndpoint:
             )
         data = response.json()
         assert data["filename"] == "my_workpackage.pdf"
+
+    def test_invalid_pdf_returns_422(self):
+        with patch("app.services.pdf_service.PdfReader", side_effect=Exception("invalid pdf")):
+            response = client.post(
+                "/api/analyze-pdf",
+                files={"file": ("invalid.pdf", _make_fake_pdf_bytes(), "application/pdf")},
+            )
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Could not read the uploaded PDF."
+
+    def test_oversized_pdf_returns_413(self, monkeypatch):
+        monkeypatch.setattr("app.config.MAX_UPLOAD_SIZE_BYTES", 8)
+        response = client.post(
+            "/api/analyze-pdf",
+            files={"file": ("large.pdf", b"%PDF-1.4 too large", "application/pdf")},
+        )
+        assert response.status_code == 413
+
+
+class TestAnalyzePdfJobEndpoints:
+    def test_job_flow_returns_status_and_result(self):
+        with _patch_pdf_extraction(SAMPLE_PDF_TEXT):
+            response = client.post(
+                "/api/analyze-pdf/jobs",
+                files={"file": ("workpackage.pdf", _make_fake_pdf_bytes(), "application/pdf")},
+            )
+
+        assert response.status_code == 202
+        job = response.json()
+        assert job["job_id"]
+        assert job["status"] in {"queued", "processing", "completed"}
+
+        status_response = client.get(f"/api/analyze-pdf/jobs/{job['job_id']}")
+        assert status_response.status_code == 200
+        status_body = status_response.json()
+        assert status_body["status"] == "completed"
+        assert status_body["result_available"] is True
+
+        result_response = client.get(f"/api/analyze-pdf/jobs/{job['job_id']}/result")
+        assert result_response.status_code == 200
+        assert result_response.json()["tasks_detected"] > 0
+
+    def test_job_result_returns_404_for_unknown_job(self):
+        response = client.get("/api/analyze-pdf/jobs/does-not-exist/result")
+        assert response.status_code == 404
